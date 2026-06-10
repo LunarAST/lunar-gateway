@@ -1,34 +1,59 @@
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+use std::collections::HashMap;
 use worker::*;
 
-pub fn verify_token(token: &str, public_key_hex: &str) -> Result<bool> {
-    // Token format: header.payload.signature (base64url encoded)
+/// Load public keys from the LUNAR_PUBLIC_KEYS environment variable (JSON map).
+fn load_public_keys(ctx: &RouteContext<()>) -> HashMap<String, VerifyingKey> {
+    let mut map = HashMap::new();
+    if let Ok(raw) = ctx.var("LUNAR_PUBLIC_KEYS") {
+        if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&raw.to_string()) {
+            for (project, hex_key) in parsed {
+                if let Ok(bytes) = hex::decode(&hex_key) {
+                    if let Ok(key) = VerifyingKey::from_bytes(&bytes[..32].try_into().unwrap_or_default()) {
+                        map.insert(project, key);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Verify a JWT token against the public key for a given project.
+/// Token format: header.payload.signature (base64url encoded).
+/// The JWT `sub` claim identifies the project.
+pub fn verify_token(token: &str, project: &str, ctx: &RouteContext<()>) -> Result<bool> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Ok(false);
     }
 
-    // Decode public key from hex
-    let public_key_bytes = hex::decode(public_key_hex)
-        .map_err(|_| Error::RustError("Invalid public key hex".into()))?;
-    let public_key = VerifyingKey::from_bytes(
-        &public_key_bytes[..32].try_into()
-            .map_err(|_| Error::RustError("Invalid public key length".into()))?
-    ).map_err(|_| Error::RustError("Invalid public key".into()))?;
+    // Decode payload to extract sub (project name)
+    let payload_json = base64_url_decode(parts[1])
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    let sub_matches = payload_json.contains(&format!("\"sub\":\"{}\"", project));
 
-    // Decode signature (base64url -> bytes)
+    if !sub_matches {
+        return Ok(false);
+    }
+
+    let public_keys = load_public_keys(ctx);
+    let public_key = match public_keys.get(project) {
+        Some(k) => k,
+        None => return Ok(false),
+    };
+
     let signature_bytes = base64_url_decode(parts[2])
         .ok_or_else(|| Error::RustError("Invalid signature encoding".into()))?;
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|_| Error::RustError("Invalid signature".into()))?;
 
-    // Reconstruct signing message (header.payload)
     let message = format!("{}.{}", parts[0], parts[1]);
     Ok(public_key.verify(message.as_bytes(), &signature).is_ok())
 }
 
 fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
-    // Convert standard base64url to base64
     let mut buf = input.replace('-', "+").replace('_', "/");
     while buf.len() % 4 != 0 {
         buf.push('=');

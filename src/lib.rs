@@ -10,7 +10,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     router
         .get_async("/healthz", |_, _| async move { Response::ok("OK") })
         .get_async("/lunar-map.json", |_, ctx| async move {
-            let bucket = ctx.bucket("LUNAR_DATA")?;
+            let bucket = ctx.bucket("LUNAR_BUCKET")?;
             let object = bucket.get("lunar-map.json").execute().await?
                 .ok_or_else(|| Error::RustError("lunar-map.json not found".into()))?;
             let body = object.body().ok_or_else(|| Error::RustError("Empty object".into()))?;
@@ -18,16 +18,16 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Response::ok(text)
         })
         .get_async("/lunar-map.md", |req, ctx| async move {
-            let bucket = ctx.bucket("LUNAR_DATA")?;
+            let bucket = ctx.bucket("LUNAR_BUCKET")?;
             let object = bucket.get("lunar-map.json").execute().await?
                 .ok_or_else(|| Error::RustError("lunar-map.json not found".into()))?;
             let body = object.body().ok_or_else(|| Error::RustError("Empty object".into()))?;
             let text = body.text().await?;
 
-            // Parse query parameters manually from worker::Url
+            // Parse query parameters
             let url = req.url()?;
             let query_str = url.query().unwrap_or("");
-            let params: std::collections::HashMap<String, String> = parse_query(query_str);
+            let params = parse_query(query_str);
 
             let options = render::MdOptions {
                 summary: params.get("summary").map_or(false, |v| v == "true"),
@@ -41,19 +41,26 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .map_err(|e| Error::RustError(e.to_string()))?;
             Response::ok(md)
         })
+        // Private endpoint with JWT verification
         .get_async("/private/lunar-map.md", |req, ctx| async move {
             let auth_header = req.headers().get("Authorization")?.unwrap_or_default();
             if !auth_header.starts_with("Bearer ") {
                 return Response::error("Unauthorized", 401);
             }
             let token = auth_header.trim_start_matches("Bearer ").trim();
-            let public_key_hex = ctx.var("PUBLIC_KEY")?.to_string();
-            let valid = auth::verify_token(token, &public_key_hex)?;
+
+            // Extract project name from JWT payload (sub claim)
+            let project = extract_sub_from_jwt(token).unwrap_or_default();
+            if project.is_empty() {
+                return Response::error("Invalid token: missing sub", 401);
+            }
+
+            let valid = auth::verify_token(token, &project, &ctx)?;
             if !valid {
                 return Response::error("Forbidden", 403);
             }
 
-            let bucket = ctx.bucket("LUNAR_DATA")?;
+            let bucket = ctx.bucket("LUNAR_BUCKET")?;
             let object = bucket.get("lunar-map.json").execute().await?
                 .ok_or_else(|| Error::RustError("lunar-map.json not found".into()))?;
             let body = object.body().ok_or_else(|| Error::RustError("Empty object".into()))?;
@@ -74,4 +81,20 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         }
     }
     map
+}
+
+/// Decode the payload of a JWT token and extract the "sub" claim.
+fn extract_sub_from_jwt(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // Base64url decode the payload
+    let mut buf = parts[1].replace('-', "+").replace('_', "/");
+    while buf.len() % 4 != 0 {
+        buf.push('=');
+    }
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, buf).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    payload["sub"].as_str().map(|s| s.to_string())
 }
