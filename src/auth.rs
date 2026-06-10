@@ -2,10 +2,10 @@ use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use std::collections::HashMap;
 use worker::*;
 
-/// Load public keys from the LUNAR_PUBLIC_KEYS environment variable (JSON map).
-fn load_public_keys(ctx: &RouteContext<()>) -> HashMap<String, VerifyingKey> {
+/// Load public keys from the LUNAR_PUBLIC_KEYS environment variable.
+fn load_public_keys(env: &Env) -> HashMap<String, VerifyingKey> {
     let mut map = HashMap::new();
-    if let Ok(raw) = ctx.var("LUNAR_PUBLIC_KEYS") {
+    if let Ok(raw) = env.var("LUNAR_PUBLIC_KEYS") {
         if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&raw.to_string()) {
             for (project, hex_key) in parsed {
                 if let Ok(bytes) = hex::decode(&hex_key) {
@@ -20,25 +20,21 @@ fn load_public_keys(ctx: &RouteContext<()>) -> HashMap<String, VerifyingKey> {
 }
 
 /// Verify a JWT token against the public key for a given project.
-/// Token format: header.payload.signature (base64url encoded).
-/// The JWT `sub` claim identifies the project.
-pub fn verify_token(token: &str, project: &str, ctx: &RouteContext<()>) -> Result<bool> {
+pub fn verify_token(token: &str, project: &str, env: &Env) -> Result<bool> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Ok(false);
     }
 
-    // Decode payload to extract sub (project name)
     let payload_json = base64_url_decode(parts[1])
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default();
     let sub_matches = payload_json.contains(&format!("\"sub\":\"{}\"", project));
-
     if !sub_matches {
         return Ok(false);
     }
 
-    let public_keys = load_public_keys(ctx);
+    let public_keys = load_public_keys(env);
     let public_key = match public_keys.get(project) {
         Some(k) => k,
         None => return Ok(false),
